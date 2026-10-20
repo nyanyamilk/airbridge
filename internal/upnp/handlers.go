@@ -45,8 +45,23 @@ func AVTransportHandler(st *state.PlayerState, player Player, em *EventManager) 
 			}
 			uri := XMLText(body, "CurrentURI")
 			meta := XMLText(body, "CurrentURIMetaData")
+			prevURI, _ := st.GetURI()
 			st.SetURI(uri, meta)
 			log.Printf("SetAVTransportURI: %s", uri)
+
+			// A new URI invalidates a paused stream: without this, the next
+			// Play would "resume" the previous track (resume is only valid for
+			// the media that is actually loaded).
+			if prevURI != "" && uri != prevURI {
+				log.Printf("SetAVTransportURI: media changed, dropping previous stream")
+				st.SetTransportState(state.StateStopped)
+				em.NotifyTransportState(string(state.StateStopped))
+				go func(p Player, ctx context.Context) {
+					if err := p.Stop(ctx); err != nil {
+						log.Printf("Stop previous stream: %v", err)
+					}
+				}(player, ctx)
+			}
 			WriteSOAPResponse(w, AVTransportType, "SetAVTransportURIResponse", "")
 
 		case "Play":

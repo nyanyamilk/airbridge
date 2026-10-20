@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kenyonj/airbridge/internal/cast"
@@ -42,6 +44,7 @@ type RendererInstance struct {
 	EventManager *upnp.EventManager
 	server       *http.Server // Per-renderer HTTP server
 	cancel       context.CancelFunc
+	lastControl  atomic.Int64 // unix seconds of the last DLNA control request
 	ssdpCancel   context.CancelFunc // Cancels SSDP announcements for this renderer
 }
 
@@ -322,10 +325,17 @@ func (b *Bridge) startRendererHTTPServer(r *RendererInstance) {
 	mux := http.NewServeMux()
 	httpserver.RegisterHTTP(mux, baseURL, r.ID, r.Name, "Airbridge", r.State, r.Player, r.EventManager)
 
+	logged := httpserver.LogMiddleware(mux)
 	r.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", r.Port),
-		Handler: httpserver.LogMiddleware(mux),
+		Addr: fmt.Sprintf(":%d", r.Port),
+		// Track control traffic so the idle watchdog can tell "the app is
+		// gone" from "the app is just not talking right now".
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			r.lastControl.Store(time.Now().Unix())
+			logged.ServeHTTP(w, req)
+		}),
 	}
+	b.startIdleWatchdog(r)
 
 	go func() {
 		log.Printf("Starting renderer HTTP server: %s on port %d", r.Name, r.Port)
@@ -799,4 +809,56 @@ func useAirPlay2(device *discovery.Device) bool {
 		return strings.HasPrefix(device.Model, "AudioAccessory")
 	}
 	return false
+}
+
+// idleTimeout reads AIRBRIDGE_IDLE_TIMEOUT_MIN (minutes, 0/empty disables).
+func idleTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("AIRBRIDGE_IDLE_TIMEOUT_MIN"))
+	if raw == "" {
+		return 0
+	}
+	mins, err := strconv.Atoi(raw)
+	if err != nil || mins <= 0 {
+		return 0
+	}
+	return time.Duration(mins) * time.Minute
+}
+
+// startIdleWatchdog stops a renderer that keeps streaming long after its
+// control point disappeared. DLNA has no heartbeat, so "no control requests for
+// N minutes while PLAYING" is the only signal available: an app that was closed
+// stops polling, while a locked phone usually keeps polling. Disabled unless
+// AIRBRIDGE_IDLE_TIMEOUT_MIN is set.
+func (b *Bridge) startIdleWatchdog(r *RendererInstance) {
+	timeout := idleTimeout()
+	if timeout <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-b.ctx.Done():
+				return
+			case <-ticker.C:
+				if r.State.GetTransportState() != state.StatePlaying {
+					continue
+				}
+				last := time.Unix(r.lastControl.Load(), 0)
+				if time.Since(last) < timeout {
+					continue
+				}
+				log.Printf("Idle timeout (%s without control traffic): stopping %s", timeout, r.Name)
+				r.State.SetTransportState(state.StateStopped)
+				r.EventManager.NotifyTransportState(string(state.StateStopped))
+				go func(p upnp.Player, ctx context.Context) {
+					if err := p.Stop(ctx); err != nil {
+						log.Printf("Idle stop error: %v", err)
+					}
+				}(r.Player, b.ctx)
+				r.State.ReleaseSession()
+			}
+		}
+	}()
 }
