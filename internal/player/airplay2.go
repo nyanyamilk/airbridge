@@ -437,6 +437,17 @@ func (p *AirPlay2Player) SetVolume(ctx context.Context, volume int) error {
 	log.Printf("AP2 SetVolume: %d", volume)
 	p.volume = volume
 
+	// A live session takes the new level immediately (cliairplay maps it onto
+	// the receiver's SET_PARAMETER volume); without a session it is simply
+	// remembered and applied by the next Play.
+	if p.cliproc != nil && p.cmd != nil {
+		if err := p.sendCmd(fmt.Sprintf("VOLUME=%d", volume)); err != nil {
+			log.Printf("AP2: live volume change failed: %v", err)
+		} else {
+			log.Printf("AP2: live volume -> %d", volume)
+		}
+	}
+
 	if p.volumePluginCallback != nil {
 		if err := p.volumePluginCallback(volume); err != nil {
 			log.Printf("Volume plugin error: %v", err)
