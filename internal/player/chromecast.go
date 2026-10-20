@@ -206,3 +206,42 @@ var _ interface {
 	Stop(ctx context.Context) error
 	SetVolume(ctx context.Context, volume int) error
 } = (*ChromecastPlayer)(nil)
+
+// Seek restarts the Chromecast session at position. go-chromecast has no
+// in-stream seek, so the media is reloaded with a start offset.
+func (p *ChromecastPlayer) Seek(ctx context.Context, position time.Duration) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.currentURI == "" {
+		return fmt.Errorf("no media selected")
+	}
+	if p.app == nil {
+		return fmt.Errorf("chromecast not connected")
+	}
+	if position < 0 {
+		position = 0
+	}
+	if err := p.app.SeekToTime(float32(position.Seconds())); err != nil {
+		return fmt.Errorf("seek: %w", err)
+	}
+	return nil
+}
+
+// Position reports the current playhead and media duration when the
+// Chromecast exposes them; unknown values are reported as zero.
+func (p *ChromecastPlayer) Position() (time.Duration, time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.app == nil {
+		return 0, 0
+	}
+	m := p.app.Media()
+	if m == nil {
+		return 0, 0
+	}
+	elapsed := time.Duration(float64(m.CurrentTime) * float64(time.Second))
+	total := time.Duration(float64(m.Media.Duration) * float64(time.Second))
+	return elapsed, total
+}

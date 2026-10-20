@@ -7,6 +7,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/kenyonj/airbridge/internal/state"
 )
@@ -17,6 +20,11 @@ type Player interface {
 	Pause(ctx context.Context) error
 	Stop(ctx context.Context) error
 	SetVolume(ctx context.Context, volume int) error
+	// Seek repositions the playhead. Backends that cannot seek in-stream
+	// restart their session at the requested offset.
+	Seek(ctx context.Context, position time.Duration) error
+	// Position reports (elapsed, total); total is 0 when unknown.
+	Position() (time.Duration, time.Duration)
 }
 
 // AVTransportHandler handles AVTransport SOAP requests.
@@ -98,6 +106,37 @@ func AVTransportHandler(st *state.PlayerState, player Player, em *EventManager) 
 			}()
 			WriteSOAPResponse(w, AVTransportType, "StopResponse", "")
 
+		case "Seek":
+			if !st.HasSession(controller) {
+				WriteSOAPError(w, 712, "Session in use")
+				return
+			}
+			unit := XMLText(body, "Unit")
+			if unit == "" {
+				unit = "REL_TIME"
+			}
+			if unit != "REL_TIME" && unit != "ABS_TIME" {
+				WriteSOAPError(w, 710, "Seek mode not supported")
+				return
+			}
+			pos, err := parseSeekTarget(XMLText(body, "Target"))
+			if err != nil {
+				log.Printf("Seek: bad target %q: %v", XMLText(body, "Target"), err)
+				WriteSOAPError(w, 711, "Illegal seek target")
+				return
+			}
+			log.Printf("AVTransport Seek to %s", formatUPnPTime(pos))
+			st.SetTransportState(state.StateTransition)
+			em.NotifyTransportState(string(state.StateTransition))
+			go func() {
+				if err := player.Seek(ctx, pos); err != nil {
+					log.Printf("Seek error: %v", err)
+				}
+				st.SetTransportState(state.StatePlaying)
+				em.NotifyTransportState(string(state.StatePlaying))
+			}()
+			WriteSOAPResponse(w, AVTransportType, "SeekResponse", "")
+
 		case "GetTransportInfo":
 			ts := st.GetTransportState()
 			resp := fmt.Sprintf(
@@ -109,23 +148,30 @@ func AVTransportHandler(st *state.PlayerState, player Player, em *EventManager) 
 
 		case "GetPositionInfo":
 			uri, _ := st.GetURI()
+			elapsed, total := player.Position()
+			track := 1
+			if uri == "" {
+				track = 0
+			}
 			resp := fmt.Sprintf(
-				"<Track>0</Track>"+
-					"<TrackDuration>00:00:00</TrackDuration>"+
+				"<Track>%d</Track>"+
+					"<TrackDuration>%s</TrackDuration>"+
 					"<TrackMetaData></TrackMetaData>"+
 					"<TrackURI>%s</TrackURI>"+
-					"<RelTime>00:00:00</RelTime>"+
-					"<AbsTime>00:00:00</AbsTime>"+
+					"<RelTime>%s</RelTime>"+
+					"<AbsTime>%s</AbsTime>"+
 					"<RelCount>0</RelCount>"+
 					"<AbsCount>0</AbsCount>",
-				html.EscapeString(uri))
+				track, formatUPnPTime(total), html.EscapeString(uri),
+				formatUPnPTime(elapsed), formatUPnPTime(elapsed))
 			WriteSOAPResponse(w, AVTransportType, "GetPositionInfoResponse", resp)
 
 		case "GetMediaInfo":
 			uri, meta := st.GetURI()
+			_, total := player.Position()
 			resp := fmt.Sprintf(
 				"<NrTracks>1</NrTracks>"+
-					"<MediaDuration>00:00:00</MediaDuration>"+
+					"<MediaDuration>%s</MediaDuration>"+
 					"<CurrentURI>%s</CurrentURI>"+
 					"<CurrentURIMetaData>%s</CurrentURIMetaData>"+
 					"<NextURI></NextURI>"+
@@ -133,7 +179,7 @@ func AVTransportHandler(st *state.PlayerState, player Player, em *EventManager) 
 					"<PlayMedium>NETWORK</PlayMedium>"+
 					"<RecordMedium>NOT_IMPLEMENTED</RecordMedium>"+
 					"<WriteStatus>NOT_IMPLEMENTED</WriteStatus>",
-				html.EscapeString(uri), html.EscapeString(meta))
+				formatUPnPTime(total), html.EscapeString(uri), html.EscapeString(meta))
 			WriteSOAPResponse(w, AVTransportType, "GetMediaInfoResponse", resp)
 
 		case "GetTransportSettings":
@@ -337,5 +383,47 @@ func EventHandlerWithState(em *EventManager, serviceID string, st *state.PlayerS
 		default:
 			w.WriteHeader(405)
 		}
+	}
+}
+
+// formatUPnPTime renders a duration as HH:MM:SS, the format UPnP expects for
+// TrackDuration / RelTime / MediaDuration.
+func formatUPnPTime(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	s := int64(d / time.Second)
+	return fmt.Sprintf("%02d:%02d:%02d", s/3600, (s%3600)/60, s%60)
+}
+
+// parseSeekTarget accepts HH:MM:SS, MM:SS or a bare second count, with an
+// optional fractional last component (some control points send 12.5).
+func parseSeekTarget(v string) (time.Duration, error) {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return 0, fmt.Errorf("empty target")
+	}
+	parts := strings.Split(s, ":")
+	if len(parts) > 3 {
+		return 0, fmt.Errorf("invalid target %q", v)
+	}
+	nums := make([]float64, len(parts))
+	for i, p := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil || f < 0 {
+			return 0, fmt.Errorf("invalid target %q", v)
+		}
+		nums[i] = f
+	}
+	switch len(nums) {
+	case 1:
+		return time.Duration(nums[0] * float64(time.Second)), nil
+	case 2:
+		return time.Duration(nums[0])*time.Minute +
+			time.Duration(nums[1]*float64(time.Second)), nil
+	default:
+		return time.Duration(nums[0])*time.Hour +
+			time.Duration(nums[1])*time.Minute +
+			time.Duration(nums[2]*float64(time.Second)), nil
 	}
 }

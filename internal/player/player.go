@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kenyonj/airbridge/internal/discovery"
 	"github.com/kenyonj/airbridge/pkg/raop"
@@ -37,6 +38,9 @@ type RAOPPlayer struct {
 	// Current state
 	currentURI string
 	volume     int
+
+	// Playback position tracking (drives GetPositionInfo / Seek)
+	clock playbackClock
 
 	// Volume passthrough for external API control
 	volumePassthrough *VolumePassthrough
@@ -72,14 +76,38 @@ func (p *RAOPPlayer) SetVolumePluginCallback(cb func(volume int) error) {
 func (p *RAOPPlayer) Play(ctx context.Context, uri string, volume int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.playFrom(ctx, uri, volume, 0)
+}
 
+// Seek restarts the stream at position. RAOP has no in-stream seek, so the
+// stream is re-opened at the offset instead.
+func (p *RAOPPlayer) Seek(ctx context.Context, position time.Duration) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.currentURI == "" {
+		return fmt.Errorf("no media selected")
+	}
+	if position < 0 {
+		position = 0
+	}
+	return p.playFrom(ctx, p.currentURI, p.volume, position)
+}
+
+// Position returns (elapsed, total) for GetPositionInfo.
+func (p *RAOPPlayer) Position() (time.Duration, time.Duration) {
+	return p.clock.Position()
+}
+
+// playFrom starts a stream at the given offset. Caller holds p.mu.
+func (p *RAOPPlayer) playFrom(ctx context.Context, uri string, volume int, offset time.Duration) error {
 	// Stop any existing stream
 	p.stopInternal()
 
 	p.currentURI = uri
 	p.volume = volume
 
-	log.Printf("RAOP Play: %s -> %s:%d (volume=%d)", uri, p.device.Host, p.device.Port, volume)
+	log.Printf("RAOP Play: %s -> %s:%d (volume=%d, offset=%s)", uri, p.device.Host, p.device.Port, volume, offset)
 
 	// Create a new context for this playback
 	playCtx, cancel := context.WithCancel(ctx)
@@ -97,25 +125,7 @@ func (p *RAOPPlayer) Play(ctx context.Context, uri string, volume int) error {
 	}
 	p.streamer = streamer
 
-	// Use FFmpeg to decode the audio stream to raw PCM
-	// Output format: 16-bit signed little-endian, 44100 Hz, stereo
-	// We add 1.5 seconds of silence at the start to compensate for player latency
-	// (AirPlay buffers ~1250ms before playback starts)
-	ffmpegArgs := []string{
-		"-hide_banner",
-		"-loglevel", "warning",
-		"-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo:d=1.5", // 1.5s silence
-		"-reconnect", "1",
-		"-reconnect_streamed", "1",
-		"-reconnect_delay_max", "5",
-		"-i", uri,
-		"-filter_complex", "[0][1]concat=n=2:v=0:a=1", // Concat silence + audio
-		"-f", "s16le", // Raw PCM, 16-bit signed little-endian
-		"-ar", "44100", // Sample rate: 44.1 kHz
-		"-ac", "2", // Channels: stereo
-		"-acodec", "pcm_s16le",
-		"-", // Output to stdout
-	}
+	ffmpegArgs := buildFFmpegArgs(uri, offset)
 
 	p.ffmpeg = exec.CommandContext(playCtx, "ffmpeg", ffmpegArgs...)
 	ffmpegOut, err := p.ffmpeg.StdoutPipe()
@@ -151,8 +161,11 @@ func (p *RAOPPlayer) Play(ctx context.Context, uri string, volume int) error {
 		}
 	}()
 
+	// Exactly one owner of Wait(): stopInternal must never call it, otherwise a
+	// seek or a new Play while the old process is still dying deadlocks p.mu.
+	go func(c *exec.Cmd) { _ = c.Wait() }(p.ffmpeg)
+
 	// Capture references for the goroutine (these may be replaced by stopInternal)
-	ffmpegCmd := p.ffmpeg
 	streamerRef := p.streamer
 
 	// Start streaming in a goroutine
@@ -164,24 +177,29 @@ func (p *RAOPPlayer) Play(ctx context.Context, uri string, volume int) error {
 			}
 		}
 
-		// Wait for ffmpeg to finish (it will exit when input ends or context cancelled)
-		_ = ffmpegCmd.Wait()
-		log.Printf("FFmpeg finished, waiting for cliraop to drain buffer...")
-
 		// Wait for cliraop to finish playing buffered audio
-		// This gives it time to play out remaining samples
 		_ = streamerRef.WaitForCompletion()
 		log.Printf("Playback complete")
 
 		// Now clean up - only nil out if still pointing to our references
 		p.mu.Lock()
-		if p.ffmpeg == ffmpegCmd {
+		if p.streamer == streamerRef {
 			p.cancel = nil
 			p.ffmpeg = nil
 			p.streamer = nil
 		}
 		p.mu.Unlock()
 	}()
+
+	// Position tracking + duration probe (feeds GetPositionInfo / Seek)
+	p.clock.Reset()
+	p.clock.Start(offset)
+	go func(c context.Context, u string) {
+		if d := probeDuration(c, u); d > 0 {
+			p.clock.SetTotal(d)
+			log.Printf("RAOP: media duration %s", formatUPnPTime(d))
+		}
+	}(playCtx, uri)
 
 	return nil
 }
@@ -204,14 +222,17 @@ func (p *RAOPPlayer) Stop(ctx context.Context) error {
 
 // stopInternal stops all resources without locking.
 func (p *RAOPPlayer) stopInternal() {
+	p.clock.Stop()
+
 	if p.cancel != nil {
 		p.cancel()
 		p.cancel = nil
 	}
 
+	// Never Wait() here: a dedicated goroutine owns that, and waiting while
+	// holding p.mu is what used to wedge every later Seek/Play.
 	if p.ffmpeg != nil && p.ffmpeg.Process != nil {
 		_ = p.ffmpeg.Process.Kill()
-		_ = p.ffmpeg.Wait()
 		p.ffmpeg = nil
 	}
 
@@ -253,7 +274,14 @@ func (p *RAOPPlayer) SetVolume(ctx context.Context, volume int) error {
 
 // callVolumePassthrough makes the HTTP request to the external volume API.
 func (p *RAOPPlayer) callVolumePassthrough(ctx context.Context, volume int) error {
-	vp := p.volumePassthrough
+	return callVolumePassthrough(ctx, p.volumePassthrough, volume)
+}
+
+// callVolumePassthrough is shared by every player implementation.
+func callVolumePassthrough(ctx context.Context, vp *VolumePassthrough, volume int) error {
+	if vp == nil {
+		return nil
+	}
 	volumeStr := fmt.Sprintf("%d", volume)
 
 	// Replace {{volume}} placeholder in URL and body
@@ -331,4 +359,15 @@ func (NullPlayer) Stop(ctx context.Context) error {
 func (NullPlayer) SetVolume(ctx context.Context, volume int) error {
 	log.Printf("[NullPlayer] SetVolume: %d", volume)
 	return nil
+}
+
+// Seek is a no-op for the NullPlayer.
+func (NullPlayer) Seek(ctx context.Context, position time.Duration) error {
+	log.Printf("[NullPlayer] Seek: %s", formatUPnPTime(position))
+	return nil
+}
+
+// Position always reports zero for the NullPlayer.
+func (NullPlayer) Position() (time.Duration, time.Duration) {
+	return 0, 0
 }

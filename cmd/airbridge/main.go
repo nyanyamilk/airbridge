@@ -290,12 +290,7 @@ func runDLNAServer(ctx context.Context, targetDevice string, httpPort int) {
 	defer st.Stop()
 
 	// Create player
-	var audioPlayer interface {
-		Play(ctx context.Context, uri string, volume int) error
-		Pause(ctx context.Context) error
-		Stop(ctx context.Context) error
-		SetVolume(ctx context.Context, volume int) error
-	}
+	var audioPlayer upnp.Player
 
 	if device != nil {
 		audioPlayer = player.NewRAOPPlayer(device)
