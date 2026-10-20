@@ -199,15 +199,23 @@ func (p *AirPlay2Player) playFrom(ctx context.Context, uri string, volume int, o
 	p.cmd = cmdFile
 	p.paused = false
 
-	cli := exec.CommandContext(playCtx, p.binPath,
+	cliArgs := []string{
 		"--protocol", "airplay2",
 		"--ap2-native",
 		"--port", strconv.Itoa(p.device.Port),
 		"--volume", strconv.Itoa(volume),
 		"--name", "Airbridge",
-		"--cmdpipe", fifo,
-		p.device.Host,
-	)
+	}
+	// The receiver model (mDNS "am") decides whether the session is
+	// MediaRemote-eligible: only sessions that pair transiently *and* present
+	// an Apple model get the reverse event channel, which is the only way Siri
+	// and the HomePod touch surface can send transport commands.
+	if p.device.Model != "" {
+		cliArgs = append(cliArgs, "--am", p.device.Model)
+	}
+	cliArgs = append(cliArgs, "--cmdpipe", fifo, p.device.Host)
+	cli := exec.CommandContext(playCtx, p.binPath, cliArgs...)
+	cli.Env = append(os.Environ(), "CLIAIRPLAY_MRP_TYPE130=1")
 	cli.Stdin = pcm
 	cout, err := cli.StdoutPipe()
 	if err != nil {
@@ -348,7 +356,17 @@ func (p *AirPlay2Player) handleRemoteCommand(cmd string) {
 	p.mu.Lock()
 	var event string
 	switch cmd {
-	case "play_pause":
+	// HomePod sends discrete "pause"/"play" for Siri and the touch surface;
+	// "play_pause" is what other receivers send for a toggle.
+	case "pause", "pause_playback":
+		if err := p.pauseInternal(); err == nil {
+			event = "paused"
+		}
+	case "play", "resume", "play_playback":
+		if err := p.resumeInternal(); err == nil {
+			event = "playing"
+		}
+	case "play_pause", "toggle":
 		if p.paused {
 			if err := p.resumeInternal(); err == nil {
 				event = "playing"
@@ -358,6 +376,9 @@ func (p *AirPlay2Player) handleRemoteCommand(cmd string) {
 				event = "paused"
 			}
 		}
+	case "stop":
+		p.stopInternal()
+		event = "stopped"
 	case "next", "previous":
 		event = cmd
 	}

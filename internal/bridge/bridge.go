@@ -263,6 +263,10 @@ func (b *Bridge) addRenderer(r *database.Renderer) error {
 						inst.State.SetTransportState(state.StatePlaying)
 						inst.EventManager.NotifyTransportState(string(state.StatePlaying))
 						log.Printf("Receiver-side resume on %s -> PLAYING", r.Name)
+					case "stopped":
+						inst.State.SetTransportState(state.StateStopped)
+						inst.EventManager.NotifyTransportState(string(state.StateStopped))
+						log.Printf("Receiver-side stop on %s -> STOPPED", r.Name)
 					case "next", "previous":
 						log.Printf("Receiver-side %s on %s ignored (no playlist)", event, r.Name)
 					}
