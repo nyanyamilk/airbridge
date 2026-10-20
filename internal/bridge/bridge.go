@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -239,12 +240,31 @@ func (b *Bridge) addRenderer(r *database.Renderer) error {
 		inst.Player = player.NewChromecastPlayer(device)
 		log.Printf("Added Chromecast renderer: %s -> %s:%d", r.Name, device.Host, device.Port)
 	default: // "airplay"
-		raopPlayer := player.NewRAOPPlayer(device)
+		// Sink selection. RAOP (AirPlay 1) stays the default; HomePod OS 27
+		// silently drops third-party AirPlay 1 audio, so those setups run the
+		// AirPlay 2 flow instead. Selected per deployment with AIRBRIDGE_SINK.
+		var vol volumeConfigurable
+		if useAirPlay2(device) {
+			if ap2, err := player.NewAirPlay2Player(device); err != nil {
+				log.Printf("Warning: AirPlay 2 sink unavailable for %s (%v); falling back to RAOP", r.Name, err)
+			} else {
+				inst.Player = ap2
+				vol = ap2
+				log.Printf("Added AirPlay 2 (native) renderer: %s -> %s:%d", r.Name, device.Host, device.Port)
+			}
+		}
+		if inst.Player == nil {
+			rp := player.NewRAOPPlayer(device)
+			inst.Player = rp
+			vol = rp
+			log.Printf("Added AirPlay renderer: %s -> %s:%d", r.Name, device.Host, device.Port)
+		}
+
 		// Configure volume control from plugin if set
 		if r.VolumePluginID != "" && b.plugins != nil {
 			if pluginInstance, ok := b.plugins.GetInstance(r.VolumePluginID); ok {
 				deviceID := r.VolumeDeviceID
-				raopPlayer.SetVolumePluginCallback(func(volume int) error {
+				vol.SetVolumePluginCallback(func(volume int) error {
 					return pluginInstance.SetVolume(deviceID, volume)
 				})
 				log.Printf("Configured volume plugin for %s: plugin=%s, device=%s", r.Name, r.VolumePluginID, deviceID)
@@ -253,7 +273,7 @@ func (b *Bridge) addRenderer(r *database.Renderer) error {
 			}
 		} else if r.VolumeURL != "" {
 			// Legacy volume passthrough (backward compatibility)
-			raopPlayer.SetVolumePassthrough(&player.VolumePassthrough{
+			vol.SetVolumePassthrough(&player.VolumePassthrough{
 				URL:      r.VolumeURL,
 				Method:   r.VolumeMethod,
 				Body:     r.VolumeBody,
@@ -262,8 +282,6 @@ func (b *Bridge) addRenderer(r *database.Renderer) error {
 			})
 			log.Printf("Configured legacy volume passthrough for %s: %s", r.Name, r.VolumeURL)
 		}
-		inst.Player = raopPlayer
-		log.Printf("Added AirPlay renderer: %s -> %s:%d", r.Name, device.Host, device.Port)
 	}
 
 	b.renderers[r.ID] = inst
@@ -736,4 +754,28 @@ func getLocalIP() string {
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}
+
+// volumeConfigurable is implemented by every AirPlay sink that can forward
+// volume changes to a plugin or an external API.
+type volumeConfigurable interface {
+	SetVolumePluginCallback(cb func(volume int) error)
+	SetVolumePassthrough(vp *player.VolumePassthrough)
+}
+
+// useAirPlay2 decides which AirPlay flow to use for a device.
+//
+// AIRBRIDGE_SINK:
+//   - ""/"raop"  : AirPlay 1 / RAOP (default, widest compatibility)
+//   - "ap2"      : AirPlay 2 native for every AirPlay device
+//   - "auto"     : AirPlay 2 for Apple audio devices (model AudioAccessory*),
+//     RAOP for everything else. HomePod OS 27 needs this.
+func useAirPlay2(device *discovery.Device) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("AIRBRIDGE_SINK"))) {
+	case "ap2", "airplay2", "ap2-native", "native":
+		return true
+	case "auto":
+		return strings.HasPrefix(device.Model, "AudioAccessory")
+	}
+	return false
 }
