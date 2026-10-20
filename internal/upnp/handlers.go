@@ -60,6 +60,22 @@ func AVTransportHandler(st *state.PlayerState, player Player, em *EventManager) 
 				return
 			}
 
+			// A Play after a pause resumes the existing stream instead of
+			// restarting it from the beginning.
+			if ip, ok := player.(interface{ IsPaused() bool }); ok && ip.IsPaused() {
+				if up, ok2 := player.(interface{ Unpause(context.Context) error }); ok2 {
+					st.SetTransportState(state.StatePlaying)
+					em.NotifyTransportState(string(state.StatePlaying))
+					go func() {
+						if err := up.Unpause(ctx); err != nil {
+							log.Printf("Unpause error: %v", err)
+						}
+					}()
+					WriteSOAPResponse(w, AVTransportType, "PlayResponse", "")
+					return
+				}
+			}
+
 			// Start playback asynchronously
 			go func() {
 				st.SetTransportState(state.StateTransition)

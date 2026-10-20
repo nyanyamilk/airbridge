@@ -33,7 +33,11 @@ type AirPlay2Player struct {
 	ffmpeg  *exec.Cmd
 	cliproc *exec.Cmd
 	fifo    string
+	cmd     *os.File // keep the command pipe open for the session
 	cancel  context.CancelFunc
+	paused  bool
+
+	remoteHandler RemoteCommandHandler
 
 	clock playbackClock
 
@@ -42,6 +46,26 @@ type AirPlay2Player struct {
 
 	volumePassthrough    *VolumePassthrough
 	volumePluginCallback func(volume int) error
+}
+
+// RemoteCommandHandler receives transport commands that originate on the
+// receiver itself (Siri, the HomePod touch surface). Events are "paused",
+// "playing", "next" and "previous".
+type RemoteCommandHandler func(event string)
+
+// SetRemoteCommandHandler registers the callback used to mirror receiver-side
+// transport commands into DLNA state.
+func (p *AirPlay2Player) SetRemoteCommandHandler(h RemoteCommandHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.remoteHandler = h
+}
+
+// IsPaused reports whether the sink is currently paused.
+func (p *AirPlay2Player) IsPaused() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.paused
 }
 
 // AirPlay2Binary returns the cliairplay path and whether it is usable.
@@ -167,6 +191,13 @@ func (p *AirPlay2Player) playFrom(ctx context.Context, uri string, volume int, o
 		return fmt.Errorf("mkfifo: %w", err)
 	}
 	p.fifo = fifo
+	cmdFile, err := os.OpenFile(fifo, os.O_RDWR, 0)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("open cmdpipe: %w", err)
+	}
+	p.cmd = cmdFile
+	p.paused = false
 
 	cli := exec.CommandContext(playCtx, p.binPath,
 		"--protocol", "airplay2",
@@ -207,6 +238,9 @@ func (p *AirPlay2Player) playFrom(ctx context.Context, uri string, volume int, o
 			if strings.Contains(line, "[STATUS] connected") {
 				once.Do(func() { close(connected) })
 			}
+			if i := strings.Index(line, "[EVENT] remote command="); i >= 0 {
+				p.handleRemoteCommand(line[i+len("[EVENT] remote command="):])
+			}
 		}
 	}
 	go scan(cout)
@@ -215,14 +249,8 @@ func (p *AirPlay2Player) playFrom(ctx context.Context, uri string, volume int, o
 	go func() {
 		select {
 		case <-connected:
-			f, err := os.OpenFile(fifo, os.O_RDWR, 0)
-			if err != nil {
-				log.Printf("AP2: cannot open cmdpipe: %v", err)
-				return
-			}
-			defer f.Close()
 			ms := time.Now().Add(800 * time.Millisecond).UnixMilli()
-			if _, err := fmt.Fprintf(f, "START_UNIX_MS=%d\nACTION=START\n", ms); err != nil {
+			if err := p.sendCmd(fmt.Sprintf("START_UNIX_MS=%d", ms), "ACTION=START"); err != nil {
 				log.Printf("AP2: START failed: %v", err)
 				return
 			}
@@ -254,9 +282,91 @@ func (p *AirPlay2Player) playFrom(ctx context.Context, uri string, volume int, o
 	return nil
 }
 
-// Pause stops the stream (AirPlay 2 pause is not supported by the CLI).
+// Pause pauses playback. cliairplay keeps the session and its stream alive and
+// simply stops releasing samples, so resuming continues where it left off.
 func (p *AirPlay2Player) Pause(ctx context.Context) error {
-	return p.Stop(ctx)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pauseInternal()
+}
+
+// Unpause resumes a paused stream.
+func (p *AirPlay2Player) Unpause(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.resumeInternal()
+}
+
+// pauseInternal pauses the sink. Caller holds p.mu.
+func (p *AirPlay2Player) pauseInternal() error {
+	if p.cliproc == nil || p.paused {
+		return nil
+	}
+	if err := p.sendCmd("ACTION=PAUSE"); err != nil {
+		return err
+	}
+	p.paused = true
+	p.clock.Stop()
+	log.Printf("AP2: paused, session kept open")
+	return nil
+}
+
+// resumeInternal resumes a paused sink. Caller holds p.mu.
+func (p *AirPlay2Player) resumeInternal() error {
+	if p.cliproc == nil || !p.paused {
+		return nil
+	}
+	if err := p.sendCmd("ACTION=PLAY"); err != nil {
+		return err
+	}
+	p.paused = false
+	p.clock.Start(p.clock.Base())
+	log.Printf("AP2: resumed from %s", formatUPnPTime(p.clock.Base()))
+	return nil
+}
+
+// sendCmd writes one or more command lines to cliairplay's command pipe.
+func (p *AirPlay2Player) sendCmd(lines ...string) error {
+	if p.cmd == nil {
+		return fmt.Errorf("command pipe not open")
+	}
+	for _, line := range lines {
+		if _, err := p.cmd.WriteString(line + "\n"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// handleRemoteCommand maps receiver-side transport commands onto the sink.
+func (p *AirPlay2Player) handleRemoteCommand(cmd string) {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return
+	}
+
+	p.mu.Lock()
+	var event string
+	switch cmd {
+	case "play_pause":
+		if p.paused {
+			if err := p.resumeInternal(); err == nil {
+				event = "playing"
+			}
+		} else {
+			if err := p.pauseInternal(); err == nil {
+				event = "paused"
+			}
+		}
+	case "next", "previous":
+		event = cmd
+	}
+	h := p.remoteHandler
+	p.mu.Unlock()
+
+	if h != nil && event != "" {
+		h(event)
+	}
 }
 
 // Stop tears the session down.
@@ -271,6 +381,13 @@ func (p *AirPlay2Player) Stop(ctx context.Context) error {
 // stopInternal releases resources. Caller holds p.mu.
 func (p *AirPlay2Player) stopInternal() {
 	p.clock.Stop()
+
+	if p.cmd != nil {
+		_ = p.sendCmd("ACTION=STOP")
+		_ = p.cmd.Close()
+		p.cmd = nil
+	}
+	p.paused = false
 
 	if p.cancel != nil {
 		p.cancel()

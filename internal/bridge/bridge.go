@@ -40,7 +40,7 @@ type RendererInstance struct {
 	State        *state.PlayerState
 	Player       upnp.Player // Generic player interface
 	EventManager *upnp.EventManager
-	server       *http.Server      // Per-renderer HTTP server
+	server       *http.Server // Per-renderer HTTP server
 	cancel       context.CancelFunc
 	ssdpCancel   context.CancelFunc // Cancels SSDP announcements for this renderer
 }
@@ -250,6 +250,23 @@ func (b *Bridge) addRenderer(r *database.Renderer) error {
 			} else {
 				inst.Player = ap2
 				vol = ap2
+				// Receiver-side commands (Siri, HomePod touch) must be mirrored
+				// into DLNA state, otherwise the control point keeps showing
+				// PLAYING after the speaker was paused by hand.
+				ap2.SetRemoteCommandHandler(func(event string) {
+					switch event {
+					case "paused":
+						inst.State.SetTransportState(state.StatePaused)
+						inst.EventManager.NotifyTransportState(string(state.StatePaused))
+						log.Printf("Receiver-side pause on %s (Siri/touch) -> PAUSED", r.Name)
+					case "playing":
+						inst.State.SetTransportState(state.StatePlaying)
+						inst.EventManager.NotifyTransportState(string(state.StatePlaying))
+						log.Printf("Receiver-side resume on %s -> PLAYING", r.Name)
+					case "next", "previous":
+						log.Printf("Receiver-side %s on %s ignored (no playlist)", event, r.Name)
+					}
+				})
 				log.Printf("Added AirPlay 2 (native) renderer: %s -> %s:%d", r.Name, device.Host, device.Port)
 			}
 		}
