@@ -64,6 +64,7 @@ type Bridge struct {
 	server    *http.Server
 
 	renderers      map[string]*RendererInstance // keyed by renderer ID (UUID)
+	stoppedByUser  map[string]bool              // renderers stopped from the UI: never auto-recovered
 	castAdvertiser *cast.Advertiser             // Chromecast mDNS advertiser
 	castServers    map[string]*cast.Server      // CASTV2 servers per renderer
 	plugins        *plugins.Registry            // Volume control plugins
@@ -84,6 +85,7 @@ func NewBridge(db *database.DB, disco *discovery.Service, port int) *Bridge {
 		disco:          disco,
 		port:           port,
 		renderers:      make(map[string]*RendererInstance),
+		stoppedByUser:  make(map[string]bool),
 		castAdvertiser: cast.NewAdvertiser(),
 		castServers:    make(map[string]*cast.Server),
 	}
@@ -130,6 +132,10 @@ func (b *Bridge) Start(ctx context.Context) error {
 	if err := b.startHTTPServer(); err != nil {
 		return fmt.Errorf("start HTTP server: %w", err)
 	}
+
+	// A receiver that was off during the initial discovery window stays
+	// "Standby" forever otherwise: keep retrying in the background.
+	go b.rendererRecoveryLoop()
 
 	return nil
 }
@@ -531,6 +537,10 @@ func (b *Bridge) GetRenderersByPlugin(pluginID string) []string {
 
 // StartRenderer starts a renderer by ID.
 func (b *Bridge) StartRenderer(id string) error {
+	b.mu.Lock()
+	delete(b.stoppedByUser, id)
+	b.mu.Unlock()
+
 	renderer, err := b.db.GetRenderer(id)
 	if err != nil {
 		return err
@@ -543,6 +553,9 @@ func (b *Bridge) StartRenderer(id string) error {
 
 // StopRenderer stops a renderer by ID.
 func (b *Bridge) StopRenderer(id string) {
+	b.mu.Lock()
+	b.stoppedByUser[id] = true
+	b.mu.Unlock()
 	b.RemoveRenderer(id)
 }
 
@@ -861,4 +874,64 @@ func (b *Bridge) startIdleWatchdog(r *RendererInstance) {
 			}
 		}
 	}()
+}
+
+// rendererRecoveryLoop loads enabled renderers that have no live instance once
+// their target device becomes discoverable again. Renderers are otherwise only
+// loaded at startup, so a HomePod that was unplugged (or on another network)
+// during that window stayed in Standby until someone clicked Start.
+func (b *Bridge) rendererRecoveryLoop() {
+	const interval = 20 * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	lastFailure := make(map[string]time.Time)
+
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		case <-ticker.C:
+			renderers, err := b.db.ListRenderers()
+			if err != nil {
+				continue
+			}
+			for _, r := range renderers {
+				if !r.Enabled || b.IsRunning(r.ID) || b.isStoppedByUser(r.ID) {
+					continue
+				}
+
+				deviceID := r.DeviceID
+				if deviceID == "" {
+					deviceID = r.AirPlayDeviceID
+				}
+				if b.disco.GetDevice(deviceID) == nil {
+					continue
+				}
+
+				if err := b.StartRenderer(r.ID); err != nil {
+					if time.Since(lastFailure[r.ID]) > 5*time.Minute {
+						log.Printf("Recovery of renderer %s failed: %v", r.Name, err)
+						lastFailure[r.ID] = time.Now()
+					}
+					continue
+				}
+				log.Printf("Recovered renderer %s: its device is discoverable again", r.Name)
+
+				if r.CastEnabled {
+					if err := b.EnableCastReceiver(r.ID, r.CastPort); err != nil {
+						log.Printf("Recovery: cast receiver for %s: %v", r.Name, err)
+					}
+				}
+			}
+		}
+	}
+}
+
+// isStoppedByUser reports whether a renderer was explicitly stopped from the
+// UI, in which case the recovery loop must leave it alone.
+func (b *Bridge) isStoppedByUser(id string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.stoppedByUser[id]
 }
