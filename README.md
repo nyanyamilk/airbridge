@@ -23,7 +23,11 @@ Some AirPlay devices (like [Juke Audio](https://jukeaudio.com/) multi-zone speak
 - 🌐 Web admin interface with real-time status updates via WebSocket
 - 🎛️ Live playback status (Playing/Idle/Paused) with instant UI updates
 - ⚙️ YAML configuration for device filtering and aliases
-- 🔊 Volume control support
+- 🔊 Volume control support, including live changes during playback
+- 🎯 Real playback position and duration, with a working AVTransport `Seek` (the progress bar is draggable)
+- 🍎 Optional native AirPlay 2 output (`AIRBRIDGE_SINK`) for receivers where third-party AirPlay 1 senders connect but stay silent (HomePod on HomePod OS 26+)
+- 📱 Receiver-side transport control: pause/resume from Siri or the device's own buttons is reported back to the DLNA controller
+- 🔁 Renderers whose device was offline at startup are loaded automatically when it reappears
 - 🐳 Docker deployment with Unraid support
 - ✅ Comprehensive test suite with CI/CD
 
@@ -33,7 +37,11 @@ Some AirPlay devices (like [Juke Audio](https://jukeaudio.com/) multi-zone speak
 
 ### What works:
 - DLNA renderer creation and discovery
-- Audio streaming to AirPlay devices
+- Audio streaming to AirPlay devices (AirPlay 1 via libraop, AirPlay 2 via cliairplay)
+- Real position/duration reporting and AVTransport `Seek`
+- Pause/resume initiated from the receiver (Siri, touch controls)
+- Volume changes applied to an active session
+- Automatic renderer recovery when a device comes back online
 - Chromecast as output target (URL-based media playback)
 - Web admin interface with live status updates
 - Real-time playback state via WebSocket
@@ -42,6 +50,35 @@ Some AirPlay devices (like [Juke Audio](https://jukeaudio.com/) multi-zone speak
 
 ### Known Limitations:
 - Chromecast *receiver* support (casting FROM apps like Spotify TO Airbridge) is blocked by Google's device authentication requirements
+- AirPlay 2 output opens a new session per track and per seek, so switching costs roughly 1-2 s; multi-room groups and stereo pairs are not implemented
+- `Seek` restarts the HTTP source at the target offset, which suits file/HTTP sources but not live streams
+
+## AirPlay 2 output (HomePod)
+
+Airbridge started out as a DLNA -> AirPlay **1** (RAOP) bridge, which is all most
+receivers need. Some newer receivers - most notably HomePod on HomePod OS 26 and
+later - complete the RAOP handshake and then play silence when a third-party
+sender is involved, even with libraop's device-model workaround.
+
+For those devices airbridge can hand the stream to
+[cliairplay](https://github.com/music-assistant/airplay-cli) and speak native
+AirPlay 2 instead. The sink is chosen per deployment:
+
+| `AIRBRIDGE_SINK` | Behaviour |
+| --- | --- |
+| `raop` (default) | Everything through `cliraop`, i.e. plain AirPlay 1 |
+| `ap2` | Everything through `cliairplay` (native AirPlay 2) |
+| `auto` | Devices advertising a model matching `AudioAccessory*` (HomePod) use AirPlay 2, everything else stays on AirPlay 1 |
+
+`auto` is the recommended setting when you own both kinds of device: the HomePod
+gets the protocol it actually plays, while an AirPlay 1-only speaker or soundbar
+keeps the path it always had.
+
+The Docker image bundles both binaries. Building from source requires
+`cliairplay` as well - see `CLIAIRPLAY_PATH`.
+
+Limitations of the AirPlay 2 path: a new session is opened per track and per
+seek (1-2 s gap), and multi-room grouping/stereo pairs are not implemented.
 
 ## Quick Start
 
@@ -138,6 +175,15 @@ devices:
   - name: "Office"
     enabled: false  # Exclude this device
 ```
+
+### Environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `AIRBRIDGE_PORT` | `8200` | HTTP port for the first renderer's control endpoints |
+| `AIRBRIDGE_SINK` | `raop` | Output protocol: `raop` (AirPlay 1), `ap2` (AirPlay 2), `auto` (AirPlay 2 only for `AudioAccessory*` devices) |
+| `CLIAIRPLAY_PATH` | searched in `./bin`, `/opt/cli`, `/usr/local/bin`, `$PATH` | Path to the cliairplay binary used for AirPlay 2 output |
+| `AIRBRIDGE_DB` | `./airbridge.db` | SQLite database used in web mode (the Docker image sets `/data/airbridge.db`) |
 
 ## Architecture
 
