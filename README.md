@@ -74,6 +74,15 @@ AirPlay 2 instead. The sink is chosen per deployment:
 gets the protocol it actually plays, while an AirPlay 1-only speaker or soundbar
 keeps the path it always had.
 
+### Volume
+
+Airbridge does not impose a volume on playback. A stream starts at whatever
+level the receiver was left at, and a level is only sent when someone asks for
+one: moving the volume slider in the web UI (or a control point issuing
+`SetVolume`) during playback changes the receiver immediately, and that level is
+then reused for later starts until the process restarts. Restored or
+plugin-reported levels are shown in the UI but never pushed.
+
 The Docker image bundles both binaries. Building from source requires
 `cliairplay` as well - see `CLIAIRPLAY_PATH`.
 
