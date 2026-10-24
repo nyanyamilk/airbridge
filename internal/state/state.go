@@ -36,8 +36,9 @@ type PlayerState struct {
 	metadata       string
 
 	// Volume state
-	volume int
-	muted  bool
+	volume    int
+	volumeSet bool // set only by an explicit user/control-point request
+	muted     bool
 
 	// Callback for state changes
 	onStateChange StateChangeCallback
@@ -148,6 +149,36 @@ func (s *PlayerState) SetVolume(v int) {
 		v = 100
 	}
 	s.volume = v
+	s.volumeSet = true
+}
+
+// SetVolumeInitial records a volume that describes the device (loaded from the
+// database or reported by a volume plugin) rather than a user choice, so it is
+// never pushed to the sink when playback starts.
+func (s *PlayerState) SetVolumeInitial(v int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if v < 0 {
+		v = 0
+	}
+	if v > 100 {
+		v = 100
+	}
+	s.volume = v
+	s.volumeSet = false
+}
+
+// GetStartVolume returns the level to hand to the sink when a stream starts.
+// Zero means "leave the receiver's volume alone", which is the default: a
+// HomePod then plays at whatever level it was left at instead of jumping to
+// our idea of the volume.
+func (s *PlayerState) GetStartVolume() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.volumeSet {
+		return 0
+	}
+	return s.volume
 }
 
 // GetVolume returns the current volume.

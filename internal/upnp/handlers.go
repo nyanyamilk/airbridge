@@ -95,7 +95,7 @@ func AVTransportHandler(st *state.PlayerState, player Player, em *EventManager) 
 			go func() {
 				st.SetTransportState(state.StateTransition)
 				em.NotifyTransportState(string(state.StateTransition))
-				if err := player.Play(ctx, uri, st.GetVolume()); err != nil {
+				if err := player.Play(ctx, uri, st.GetStartVolume()); err != nil {
 					log.Printf("Play error: %v", err)
 					st.SetTransportState(state.StateStopped)
 					em.NotifyTransportState(string(state.StateStopped))

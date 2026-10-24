@@ -501,7 +501,7 @@ func (b *Bridge) UpdateVolumeFromPlugin(pluginID, deviceID string, volume int, m
 
 			if ok && inst.State != nil && inst.EventManager != nil {
 				log.Printf("Updating volume from plugin: renderer=%s, volume=%d, muted=%v", dbRenderer.Name, volume, muted)
-				inst.State.SetVolume(volume)
+				inst.State.SetVolumeInitial(volume)
 				inst.State.SetMute(muted)
 				inst.EventManager.NotifyVolume(volume, muted)
 
@@ -614,7 +614,7 @@ func (b *Bridge) EnableCastReceiver(rendererID string, port int) error {
 		log.Printf("Cast media load: %s (%s)", url, contentType)
 		if r.Player != nil {
 			ctx := context.Background()
-			volume := r.State.GetVolume()
+			volume := r.State.GetStartVolume()
 			if err := r.Player.Play(ctx, url, volume); err != nil {
 				log.Printf("Cast Play error: %v", err)
 			}
